@@ -5,11 +5,15 @@
 #define MOTOR_REV_PIN      17
 #define CAM_HOME_PIN       13
 #define GEAR_ROTATION_PIN  33
+#define POWER_DOWN_PIN     32
 
 void setup() {
     Serial.begin(115200);
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    pinMode(POWER_DOWN_PIN, OUTPUT);
+    digitalWrite(POWER_DOWN_PIN, HIGH);
 
     pinMode(MOTOR_FWD_PIN, OUTPUT);
     pinMode(MOTOR_REV_PIN, OUTPUT);
