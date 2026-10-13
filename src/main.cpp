@@ -190,36 +190,86 @@ void setup(){
   digitalWrite(POWER_DOWN_PIN,HIGH);pinMode(POWER_DOWN_PIN,OUTPUT);
   pinMode(BUTTON_PIN,INPUT_PULLUP);pinMode(CAM_HOME_PIN,INPUT_PULLUP);pinMode(GEAR_ROTATION_PIN,INPUT_PULLUP);
   motorOff();lastGear=digitalRead(GEAR_ROTATION_PIN);lastHome=digitalRead(CAM_HOME_PIN);homeArmed=(lastHome==HIGH);
-  Serial.println("FURBY ADAPTIVE MOUTH CONTROLLER");
+  Serial.println("FURBY ADAPTIVE MOUTH CONTROLLER - TIMING FIX");
   Serial.println("H=home, 140=position, T=20 cycles, O=open, C=close, S=status, X=stop");
 }
 void loop(){
-  encoder();homeSensor();readCommands();
-  uint32_t now=millis();
-  if(mode==HOMING&&now-operationStart>=HOME_TIMEOUT_MS){abortMotion("HOME timeout");return;}
-  if(mode==PULSING&&now-pulseStart>=pulseLength)beginSettle(MOVE);
+  encoder();
+  homeSensor();
+  readCommands();
+
+  // Read time at each check. Never reuse a timestamp captured before
+  // beginSettle(), which records a NEWER motorOffAt timestamp.
+  if(mode==HOMING && (uint32_t)(millis()-operationStart)>=HOME_TIMEOUT_MS){
+    abortMotion("HOME timeout");
+    return;
+  }
+
+  if(mode==PULSING && (uint32_t)(millis()-pulseStart)>=pulseLength){
+    beginSettle(MOVE);
+    return;  // First settling check occurs in a future loop iteration.
+  }
+
   if(mode==OPENING){
-    if(pos>=openCutoff()){cutoffPos=pos;motionCutoffAt=millis();beginSettle(OPEN_DONE);}
-    else if(now-operationStart>=MOTION_TIMEOUT_MS){abortMotion("opening timeout");return;}
-  }
-  if(mode==CLOSING){
-    if(pos<=closeCutoff()){cutoffPos=pos;motionCutoffAt=millis();beginSettle(CLOSE_DONE);}
-    else if(now-operationStart>=MOTION_TIMEOUT_MS){abortMotion("closing timeout");return;}
-  }
-  if(mode==SETTLING){
-    const bool fast=talking&&(settling==OPEN_DONE||settling==CLOSE_DONE);
-    const uint32_t elapsed=now-motorOffAt;
-    const bool quiet=now-lastTickAt>=(fast?FAST_QUIET_MS:NORMAL_QUIET_MS);
-    const bool minElapsed=!fast||elapsed>=MIN_FAST_COAST_MS;
-    if(elapsed>=MAX_SETTLE_MS && !quiet){abortMotion("encoder never became quiet");return;}
-    if(quiet&&minElapsed){
-      Settle completed=settling;settling=NONE;
-      if(completed==HOME){mode=IDLE;direction=STOP;Serial.print("HOME COMPLETE. Position: ");Serial.println(pos);}
-      else if(completed==MOVE){mode=MOVING;}
-      else if(completed==OPEN_DONE){finishMouth(true);}
-      else if(completed==CLOSE_DONE){finishMouth(false);}
+    if(pos>=openCutoff()){
+      cutoffPos=pos;
+      motionCutoffAt=millis();
+      beginSettle(OPEN_DONE);
+      return;
+    }
+    if((uint32_t)(millis()-operationStart)>=MOTION_TIMEOUT_MS){
+      abortMotion("opening timeout");
+      return;
     }
   }
+
+  if(mode==CLOSING){
+    if(pos<=closeCutoff()){
+      cutoffPos=pos;
+      motionCutoffAt=millis();
+      beginSettle(CLOSE_DONE);
+      return;
+    }
+    if((uint32_t)(millis()-operationStart)>=MOTION_TIMEOUT_MS){
+      abortMotion("closing timeout");
+      return;
+    }
+  }
+
+  if(mode==SETTLING){
+    // Fresh timestamp, taken AFTER the motor-off timestamp exists.
+    const uint32_t settleNow=millis();
+    const uint32_t elapsed=(uint32_t)(settleNow-motorOffAt);
+    const uint32_t quietFor=(uint32_t)(settleNow-lastTickAt);
+    const bool fast=talking && (settling==OPEN_DONE || settling==CLOSE_DONE);
+    const uint32_t quietRequired=fast?FAST_QUIET_MS:NORMAL_QUIET_MS;
+    const bool quiet=quietFor>=quietRequired;
+    const bool minElapsed=!fast || elapsed>=MIN_FAST_COAST_MS;
+
+    if(elapsed>=MAX_SETTLE_MS){
+      abortMotion("settling timeout");
+      return;
+    }
+
+    if(quiet && minElapsed){
+      const Settle completed=settling;
+      settling=NONE;
+      if(completed==HOME){
+        mode=IDLE;
+        direction=STOP;
+        Serial.print("HOME COMPLETE. Position: ");
+        Serial.println(pos);
+      }else if(completed==MOVE){
+        mode=MOVING;
+      }else if(completed==OPEN_DONE){
+        finishMouth(true);
+      }else if(completed==CLOSE_DONE){
+        finishMouth(false);
+      }
+      return; // Do not start the next motion in this iteration.
+    }
+  }
+
   if(mode==MOVING)continueMove();
   processTalk();
 }
