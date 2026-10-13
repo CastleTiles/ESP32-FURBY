@@ -1,917 +1,225 @@
-
 #include <Arduino.h>
 #include <stdlib.h>
 #include <ctype.h>
 
-// ============================================================
-// FURBY TALKING CONTROLLER - RELIABILITY TEST
-// ESP32 + Original Furby Motor / Optical Encoder
-// ============================================================
+// Furby adaptive mouth controller - ESP32 / PlatformIO Arduino
+constexpr uint8_t BUTTON_PIN=14, MOTOR_FWD_PIN=16, MOTOR_REV_PIN=17;
+constexpr uint8_t POWER_DOWN_PIN=32, CAM_HOME_PIN=13, GEAR_ROTATION_PIN=33;
+constexpr int REV_TICKS=208, CLOSED=140, OPEN=175;
+constexpr int BASE_OPEN_CUTOFF=154, BASE_CLOSE_CUTOFF=160;
+constexpr int MAX_ADJUST=5, OPEN_TOL=8, CLOSE_TOL=6;
+constexpr uint32_t NORMAL_QUIET_MS=500, FAST_QUIET_MS=100;
+constexpr uint32_t MIN_FAST_COAST_MS=300, MAX_SETTLE_MS=2000;
+constexpr uint32_t HOME_TIMEOUT_MS=5000, MOVE_TIMEOUT_MS=15000, MOTION_TIMEOUT_MS=1500;
+constexpr int MAX_MOVE_PULSES=80, MOVE_TOL=3, TALK_CYCLES=20;
+constexpr uint32_t LARGE_PULSE_MS=50, SMALL_PULSE_MS=20;
+constexpr uint32_t MIN_COAST_TICKS=8;
 
-// PIN ASSIGNMENTS
-#define BUTTON_PIN         14
-#define MOTOR_FWD_PIN      16
-#define MOTOR_REV_PIN      17
-#define POWER_DOWN_PIN     32
-#define CAM_HOME_PIN       13
-#define GEAR_ROTATION_PIN  33
+enum Direction:int8_t { STOP=0, FWD=1, REV=-1 };
+enum Mode:uint8_t { IDLE, HOMING, MOVING, PULSING, OPENING, CLOSING, SETTLING };
+enum Settle:uint8_t { NONE, HOME, MOVE, OPEN_DONE, CLOSE_DONE };
+enum Next:uint8_t { NO_NEXT, NEXT_OPEN, NEXT_CLOSE };
+Mode mode=IDLE;
+Settle settling=NONE;
+Next nextTalk=NO_NEXT;
+Direction direction=STOP;
+int pos=0, target=0, cutoffPos=0;
+int openAdjust=0, closeAdjust=0;
+bool synced=false, talking=false;
+bool lastGear=HIGH, lastHome=HIGH, homeArmed=false;
+uint32_t totalTicks=0, poweredTicks=0, coastTicks=0;
+uint32_t operationStart=0, pulseStart=0, pulseLength=0, motorOffAt=0;
+uint32_t lastTickAt=0, lastCoastAt=0, motionStart=0, motionCutoffAt=0, talkStart=0;
+int movePulses=0, talkCycles=0;
+char command[24]; uint8_t commandLength=0;
 
-// CAM POSITIONS
-const int TICKS_PER_REV = 208;
-const int MOUTH_CLOSED = 140;
-const int MOUTH_OPEN = 175;
-
-// CALIBRATED MOTOR CUTOFFS
-const int OPEN_CUTOFF = 154;
-const int CLOSE_CUTOFF = 160;
-
-// POSITIONING
-const unsigned long LARGE_PULSE_MS = 50;
-const unsigned long SMALL_PULSE_MS = 20;
-const int POSITION_TOLERANCE = 3;
-const int MAX_MOVE_PULSES = 80;
-
-// SETTLING
-const unsigned long NORMAL_SETTLE_MS = 500;
-const unsigned long FAST_SETTLE_MS = 100;
-const unsigned long MIN_FAST_COAST_MS = 300;
-const unsigned long MAX_SETTLE_MS = 2000;
-
-// TIMEOUTS
-const unsigned long HOME_TIMEOUT_MS = 5000;
-const unsigned long MOVE_TIMEOUT_MS = 10000;
-const unsigned long MOTION_TIMEOUT_MS = 1500;
-
-// TALKING
-const int TALK_CYCLES = 4;
-
-// POSITION VALIDATION
-const int OPEN_TOLERANCE = 8;
-const int CLOSE_TOLERANCE = 6;
-
-// Minimum observed coast ticks during automatic talking.
-// Our previous successful runs typically produced 19-24.
-const unsigned long MIN_TALK_COAST_TICKS = 8;
-
-// ============================================================
-// STATES
-// ============================================================
-
-enum Direction {
-    DIR_STOP = 0,
-    DIR_FORWARD = 1,
-    DIR_REVERSE = -1
-};
-
-enum Mode {
-    MODE_IDLE,
-    MODE_HOMING,
-    MODE_MOVING,
-    MODE_PULSING,
-    MODE_OPENING,
-    MODE_CLOSING,
-    MODE_SETTLING
-};
-
-enum SettleReason {
-    SETTLE_NONE,
-    SETTLE_HOME,
-    SETTLE_MOVE,
-    SETTLE_OPEN,
-    SETTLE_CLOSE
-};
-
-enum TalkPhase {
-    TALK_NONE,
-    TALK_START_OPEN,
-    TALK_START_CLOSE
-};
-
-Mode mode = MODE_IDLE;
-SettleReason settleReason = SETTLE_NONE;
-Direction activeDirection = DIR_STOP;
-TalkPhase pendingTalkPhase = TALK_NONE;
-
-// POSITION
-int position = 0;
-int targetPosition = 0;
-int cutoffPosition = 0;
-bool synchronized = false;
-
-// ENCODER
-bool lastGearState = HIGH;
-unsigned long totalTicks = 0;
-unsigned long pulseTicks = 0;
-unsigned long coastTicks = 0;
-
-// HOME
-bool lastHomeState = HIGH;
-bool homeArmed = false;
-
-// TIMING
-unsigned long operationStart = 0;
-unsigned long pulseStart = 0;
-unsigned long motorOffTime = 0;
-unsigned long lastTickTime = 0;
-unsigned long lastCoastTickTime = 0;
-unsigned long motionStart = 0;
-unsigned long motionCutoffTime = 0;
-unsigned long currentPulseDuration = SMALL_PULSE_MS;
-
-int pulseCount = 0;
-
-// TALKING
-bool talking = false;
-int talkCycle = 0;
-unsigned long talkStart = 0;
-
-// SERIAL
-char inputBuffer[24];
-uint8_t inputLength = 0;
-
-// ============================================================
-// POSITION MATH
-// ============================================================
-
-int normalizePosition(int p) {
-    p %= TICKS_PER_REV;
-
-    if (p < 0) {
-        p += TICKS_PER_REV;
-    }
-
-    return p;
+int wrap(int p){ p%=REV_TICKS; return p<0?p+REV_TICKS:p; }
+int distance(int from,int to){ int d=wrap(to-from); return d>REV_TICKS/2?d-REV_TICKS:d; }
+void motorOff(){digitalWrite(MOTOR_FWD_PIN,LOW);digitalWrite(MOTOR_REV_PIN,LOW);}
+void motorOn(Direction d){motorOff(); if(d==FWD)digitalWrite(MOTOR_FWD_PIN,HIGH);else if(d==REV)digitalWrite(MOTOR_REV_PIN,HIGH);}
+void resetMotion(){mode=IDLE;settling=NONE;direction=STOP;nextTalk=NO_NEXT;talking=false;}
+void abortMotion(const char* why){motorOff();resetMotion();synced=false;Serial.print("ABORT: ");Serial.println(why);Serial.println("Position uncertain; use H to re-home.");}
+void encoder(){
+  bool v=digitalRead(GEAR_ROTATION_PIN);
+  if(lastGear==HIGH && v==LOW){
+    uint32_t t=millis(); ++totalTicks;
+    if(mode==PULSING||mode==OPENING||mode==CLOSING)++poweredTicks;
+    else if(mode==SETTLING){++coastTicks;lastCoastAt=t;}
+    if(synced && direction!=STOP)pos=wrap(pos+(int)direction);
+    lastTickAt=t;
+  }
+  lastGear=v;
 }
-
-int signedDistance(int from, int to) {
-    int delta = normalizePosition(to - from);
-
-    if (delta > TICKS_PER_REV / 2) {
-        delta -= TICKS_PER_REV;
-    }
-
-    return delta;
+void beginSettle(Settle reason){
+  motorOff();motorOffAt=millis();lastTickAt=motorOffAt;lastCoastAt=motorOffAt;
+  settling=reason;mode=SETTLING;
 }
-
-// ============================================================
-// MOTOR CONTROL
-// ============================================================
-
-void motorOff() {
-    digitalWrite(MOTOR_FWD_PIN, LOW);
-    digitalWrite(MOTOR_REV_PIN, LOW);
+void homeSensor(){
+  bool v=digitalRead(CAM_HOME_PIN);
+  if(v==HIGH)homeArmed=true;
+  if(lastHome==HIGH && v==LOW && homeArmed){
+    homeArmed=false;
+    if(mode==HOMING){
+      pos=0;synced=true;direction=FWD;
+      Serial.println("HOME detected.");beginSettle(HOME);
+    }
+  }
+  lastHome=v;
 }
-
-void motorOn(Direction dir) {
-    motorOff();
-
-    if (dir == DIR_FORWARD) {
-        digitalWrite(MOTOR_FWD_PIN, HIGH);
-    }
-    else if (dir == DIR_REVERSE) {
-        digitalWrite(MOTOR_REV_PIN, HIGH);
-    }
+void startHome(){
+  if(mode!=IDLE||talking){Serial.println("Busy.");return;}
+  synced=false;direction=FWD;operationStart=millis();mode=HOMING;
+  Serial.println("Searching for HOME...");motorOn(FWD);
 }
-
-// ============================================================
-// STOP / ABORT
-// ============================================================
-
-void stopEverything() {
-    motorOff();
-
-    mode = MODE_IDLE;
-    settleReason = SETTLE_NONE;
-    activeDirection = DIR_STOP;
-
-    talking = false;
-    pendingTalkPhase = TALK_NONE;
-
-    synchronized = false;
-
-    Serial.println();
-    Serial.println("STOPPED - POSITION UNCERTAIN");
-    Serial.println("Use H to re-home.");
+void startMove(int p){
+  if(mode!=IDLE||talking){Serial.println("Busy.");return;}
+  if(!synced){Serial.println("Use H first.");return;}
+  target=wrap(p);movePulses=0;operationStart=millis();mode=MOVING;
+  Serial.print("Moving to ");Serial.println(target);
 }
-
-void abortTalking(const char *reason) {
-    motorOff();
-
-    Serial.println();
-    Serial.println("!!! TALKING ABORTED !!!");
-    Serial.println(reason);
-
-    Serial.print("Estimated position: ");
-    Serial.println(position);
-
-    talking = false;
-    pendingTalkPhase = TALK_NONE;
-
-    mode = MODE_IDLE;
-    settleReason = SETTLE_NONE;
-    activeDirection = DIR_STOP;
-
-    synchronized = false;
-
-    Serial.println("Re-home with H before continuing.");
+void continueMove(){
+  if(mode!=MOVING)return;
+  int d=distance(pos,target);
+  if(abs(d)<=MOVE_TOL){mode=IDLE;direction=STOP;Serial.print("TARGET REACHED: ");Serial.println(pos);return;}
+  if(++movePulses>MAX_MOVE_PULSES||millis()-operationStart>MOVE_TIMEOUT_MS){abortMotion("positioning timeout");return;}
+  direction=d>0?FWD:REV;
+  pulseLength=abs(d)>20?LARGE_PULSE_MS:SMALL_PULSE_MS;
+  poweredTicks=coastTicks=0;pulseStart=millis();mode=PULSING;
+  motorOn(direction);
+  Serial.print("Pulse ");Serial.print(direction==FWD?"FWD ":"REV ");Serial.print(pulseLength);Serial.println(" ms");
 }
-
-// ============================================================
-// ENCODER
-// ============================================================
-
-void updateEncoder() {
-    bool current = digitalRead(GEAR_ROTATION_PIN);
-
-    if (lastGearState == HIGH && current == LOW) {
-        totalTicks++;
-
-        if (mode == MODE_PULSING ||
-            mode == MODE_OPENING ||
-            mode == MODE_CLOSING) {
-            pulseTicks++;
-        }
-        else if (mode == MODE_SETTLING) {
-            coastTicks++;
-            lastCoastTickTime = millis();
-        }
-
-        // Single-channel encoder:
-        // Direction is inferred from commanded motor direction.
-        if (synchronized && activeDirection != DIR_STOP) {
-            position = normalizePosition(
-                position + (int)activeDirection
-            );
-        }
-
-        lastTickTime = millis();
-    }
-
-    lastGearState = current;
+int openCutoff(){return BASE_OPEN_CUTOFF+openAdjust;}
+int closeCutoff(){return BASE_CLOSE_CUTOFF+closeAdjust;}
+bool startMouth(bool opening){
+  if(mode!=IDLE||!synced)return false;
+  const int reference=opening?CLOSED:OPEN;
+  const int allowed=opening?6:9;
+  if(abs(distance(pos,reference))>allowed)return false;
+  poweredTicks=coastTicks=0;direction=opening?FWD:REV;
+  operationStart=motionStart=millis();mode=opening?OPENING:CLOSING;
+  Serial.println(opening?"\nMOUTH OPENING":"\nMOUTH CLOSING");
+  Serial.print("Start: ");Serial.print(pos);
+  Serial.print(" | cutoff: ");Serial.println(opening?openCutoff():closeCutoff());
+  motorOn(direction);return true;
 }
-
-// ============================================================
-// HOME SENSOR
-// ============================================================
-
-void updateHome() {
-    bool current = digitalRead(CAM_HOME_PIN);
-
-    if (current == HIGH) {
-        homeArmed = true;
-    }
-
-    if (lastHomeState == HIGH &&
-        current == LOW &&
-        homeArmed) {
-
-        homeArmed = false;
-
-        if (mode == MODE_HOMING) {
-            position = 0;
-            synchronized = true;
-
-            Serial.println("HOME detected.");
-
-            motorOff();
-
-            motorOffTime = millis();
-            lastTickTime = motorOffTime;
-            lastCoastTickTime = motorOffTime;
-
-            activeDirection = DIR_FORWARD;
-
-            settleReason = SETTLE_HOME;
-            mode = MODE_SETTLING;
-        }
-    }
-
-    lastHomeState = current;
+void startTalking(){
+  if(mode!=IDLE||talking){Serial.println("Busy.");return;}
+  if(!synced){Serial.println("Use H first.");return;}
+  if(abs(distance(pos,CLOSED))>6){Serial.println("Move near 140 first.");return;}
+  talking=true;talkCycles=0;talkStart=millis();nextTalk=NEXT_OPEN;
+  Serial.println("\n=== ADAPTIVE TALKING TEST: 20 CYCLES ===");
+  Serial.print("Initial cutoffs OPEN/CLOSE: ");Serial.print(openCutoff());Serial.print(" / ");Serial.println(closeCutoff());
 }
-
-// ============================================================
-// HOMING
-// ============================================================
-
-void startHoming() {
-    if (mode != MODE_IDLE) {
-        Serial.println("Busy.");
-        return;
-    }
-
-    synchronized = false;
-    talking = false;
-    pendingTalkPhase = TALK_NONE;
-
-    pulseTicks = 0;
-    coastTicks = 0;
-
-    activeDirection = DIR_FORWARD;
-    operationStart = millis();
-
-    settleReason = SETTLE_NONE;
-    mode = MODE_HOMING;
-
-    Serial.println();
-    Serial.println("Searching for HOME...");
-
-    motorOn(DIR_FORWARD);
+void finishMouth(bool opening){
+  const uint32_t now=millis();
+  const int goal=opening?OPEN:CLOSED;
+  const int error=distance(pos,goal); // target - actual; positive means too short in forward direction
+  const int tolerance=opening?OPEN_TOL:CLOSE_TOL;
+  const int oldCutoff=opening?openCutoff():closeCutoff();
+  Serial.println(opening?"--- OPEN RESULT ---":"--- CLOSE RESULT ---");
+  Serial.print("Cutoff: ");Serial.print(cutoffPos);
+  Serial.print(" | powered ticks: ");Serial.print(poweredTicks);
+  Serial.print(" | coast ticks: ");Serial.println(coastTicks);
+  Serial.print("Final: ");Serial.print(pos);
+  Serial.print(" | target: ");Serial.print(goal);
+  Serial.print(" | signed error: ");Serial.println(error);
+  Serial.print("Powered ms: ");Serial.print(motionCutoffAt-motionStart);
+  Serial.print(" | last coast tick ms: ");Serial.print(coastTicks?lastCoastAt-motionCutoffAt:0);
+  Serial.print(" | quiet ms: ");Serial.print(now-lastTickAt);
+  Serial.print(" | total ms: ");Serial.println(now-motionStart);
+  mode=IDLE;direction=STOP;settling=NONE;
+  if(!talking)return;
+  if(coastTicks<MIN_COAST_TICKS){abortMotion("too few coast ticks");return;}
+  if(abs(error)>tolerance){abortMotion("mouth outside allowed range");return;}
+  // Conservative integral correction: one cutoff tick per completed motion,
+  // with a deadband of +/-2 ticks. Independent corrections for each direction.
+  // For both directions: positive error means stop too short in the forward
+  // coordinate, so move the cutoff forward by one tick; negative means backward.
+  int change=error>2?1:(error< -2?-1:0);
+  if(opening)openAdjust=constrain(openAdjust+change,-MAX_ADJUST,MAX_ADJUST);
+  else closeAdjust=constrain(closeAdjust+change,-MAX_ADJUST,MAX_ADJUST);
+  Serial.print("Adaptive cutoff: ");Serial.print(oldCutoff);
+  Serial.print(" -> ");Serial.println(opening?openCutoff():closeCutoff());
+  if(opening)nextTalk=NEXT_CLOSE;
+  else{
+    ++talkCycles;Serial.print("Completed cycle ");Serial.print(talkCycles);Serial.print("/");Serial.println(TALK_CYCLES);
+    if(talkCycles>=TALK_CYCLES){talking=false;nextTalk=NO_NEXT;Serial.print("TALK COMPLETE, ms: ");Serial.println(millis()-talkStart);}
+    else nextTalk=NEXT_OPEN;
+  }
 }
-
-// ============================================================
-// POSITIONING
-// ============================================================
-
-void startPulse(Direction dir, unsigned long duration) {
-    activeDirection = dir;
-
-    pulseTicks = 0;
-    coastTicks = 0;
-
-    currentPulseDuration = duration;
-    pulseStart = millis();
-    lastTickTime = pulseStart;
-
-    mode = MODE_PULSING;
-    motorOn(dir);
-
-    Serial.print("Pulse ");
-    Serial.print(dir == DIR_FORWARD ? "FWD " : "REV ");
-    Serial.print(duration);
-    Serial.println(" ms");
+void processTalk(){
+  if(!talking||mode!=IDLE||nextTalk==NO_NEXT)return;
+  Next n=nextTalk;nextTalk=NO_NEXT;
+  if(!startMouth(n==NEXT_OPEN))abortMotion("could not start next mouth movement");
 }
-
-void startMove(int target) {
-    if (mode != MODE_IDLE) {
-        Serial.println("Busy.");
-        return;
-    }
-
-    if (!synchronized) {
-        Serial.println("Use H first.");
-        return;
-    }
-
-    talking = false;
-    pendingTalkPhase = TALK_NONE;
-
-    targetPosition = normalizePosition(target);
-    operationStart = millis();
-    pulseCount = 0;
-
-    mode = MODE_MOVING;
-
-    Serial.print("Moving to ");
-    Serial.println(targetPosition);
+void status(){
+  Serial.print("Synced: ");Serial.print(synced?"YES":"NO");
+  Serial.print(" | position: ");Serial.print(pos);
+  Serial.print(" | total ticks: ");Serial.print(totalTicks);
+  Serial.print(" | cutoffs OPEN/CLOSE: ");Serial.print(openCutoff());Serial.print("/");Serial.println(closeCutoff());
 }
-
-void continueMove() {
-    if (mode != MODE_MOVING) {
-        return;
-    }
-
-    int delta = signedDistance(position, targetPosition);
-    int distance = abs(delta);
-
-    if (distance <= POSITION_TOLERANCE) {
-        Serial.print("TARGET REACHED: ");
-        Serial.println(position);
-
-        mode = MODE_IDLE;
-        activeDirection = DIR_STOP;
-        return;
-    }
-
-    if (pulseCount >= MAX_MOVE_PULSES ||
-        millis() - operationStart >= MOVE_TIMEOUT_MS) {
-        Serial.println("MOVE TIMEOUT");
-        stopEverything();
-        return;
-    }
-
-    Direction dir =
-        delta > 0 ? DIR_FORWARD : DIR_REVERSE;
-
-    unsigned long duration =
-        distance > 20 ? LARGE_PULSE_MS : SMALL_PULSE_MS;
-
-    pulseCount++;
-    startPulse(dir, duration);
+void handle(char *s){
+  if((s[0]=='X'||s[0]=='x')&&s[1]=='\0'){abortMotion("manual stop");return;}
+  if((s[0]=='S'||s[0]=='s')&&s[1]=='\0'){status();return;}
+  if((s[0]=='H'||s[0]=='h')&&s[1]=='\0'){startHome();return;}
+  if((s[0]=='T'||s[0]=='t')&&s[1]=='\0'){startTalking();return;}
+  if((s[0]=='O'||s[0]=='o')&&s[1]=='\0'){
+    if(!startMouth(true))Serial.println("Cannot open: busy, not homed, or wrong starting position.");return;
+  }
+  if((s[0]=='C'||s[0]=='c')&&s[1]=='\0'){
+    if(!startMouth(false))Serial.println("Cannot close: busy, not homed, or wrong starting position.");return;
+  }
+  if(isdigit((unsigned char)s[0])){
+    char* end;long v=strtol(s,&end,10);
+    if(*end=='\0'&&v>=0&&v<REV_TICKS){startMove((int)v);return;}
+  }
+  Serial.println("Unknown command.");
 }
-
-// ============================================================
-// CONTINUOUS MOUTH MOTIONS
-// ============================================================
-
-bool startOpening() {
-    if (mode != MODE_IDLE || !synchronized) {
-        return false;
-    }
-
-    if (abs(signedDistance(position, MOUTH_CLOSED)) > 5) {
-        Serial.println("Move near 140 first.");
-        return false;
-    }
-
-    pulseTicks = 0;
-    coastTicks = 0;
-
-    activeDirection = DIR_FORWARD;
-    operationStart = millis();
-    motionStart = operationStart;
-
-    settleReason = SETTLE_NONE;
-    mode = MODE_OPENING;
-
-    Serial.println();
-    Serial.println("MOUTH OPENING");
-
-    Serial.print("Start: ");
-    Serial.println(position);
-
-    motorOn(DIR_FORWARD);
-    return true;
+void readCommands(){
+  while(Serial.available()){
+    char c=Serial.read();
+    if(c=='\r'||c=='\n'){
+      if(commandLength){command[commandLength]='\0';handle(command);commandLength=0;}
+    }else if(commandLength<sizeof(command)-1)command[commandLength++]=c;
+  }
 }
-
-bool startClosing() {
-    if (mode != MODE_IDLE || !synchronized) {
-        return false;
-    }
-
-    if (abs(signedDistance(position, MOUTH_OPEN)) > 8) {
-        Serial.println("Move near 175 first.");
-        return false;
-    }
-
-    pulseTicks = 0;
-    coastTicks = 0;
-
-    activeDirection = DIR_REVERSE;
-    operationStart = millis();
-    motionStart = operationStart;
-
-    settleReason = SETTLE_NONE;
-    mode = MODE_CLOSING;
-
-    Serial.println();
-    Serial.println("MOUTH CLOSING");
-
-    Serial.print("Start: ");
-    Serial.println(position);
-
-    motorOn(DIR_REVERSE);
-    return true;
+void setup(){
+  Serial.begin(115200);
+  digitalWrite(MOTOR_FWD_PIN,LOW);digitalWrite(MOTOR_REV_PIN,LOW);
+  pinMode(MOTOR_FWD_PIN,OUTPUT);pinMode(MOTOR_REV_PIN,OUTPUT);
+  digitalWrite(POWER_DOWN_PIN,HIGH);pinMode(POWER_DOWN_PIN,OUTPUT);
+  pinMode(BUTTON_PIN,INPUT_PULLUP);pinMode(CAM_HOME_PIN,INPUT_PULLUP);pinMode(GEAR_ROTATION_PIN,INPUT_PULLUP);
+  motorOff();lastGear=digitalRead(GEAR_ROTATION_PIN);lastHome=digitalRead(CAM_HOME_PIN);homeArmed=(lastHome==HIGH);
+  Serial.println("FURBY ADAPTIVE MOUTH CONTROLLER");
+  Serial.println("H=home, 140=position, T=20 cycles, O=open, C=close, S=status, X=stop");
 }
-
-// ============================================================
-// TALKING
-// ============================================================
-
-void startTalking() {
-    if (mode != MODE_IDLE) {
-        Serial.println("Busy.");
-        return;
+void loop(){
+  encoder();homeSensor();readCommands();
+  uint32_t now=millis();
+  if(mode==HOMING&&now-operationStart>=HOME_TIMEOUT_MS){abortMotion("HOME timeout");return;}
+  if(mode==PULSING&&now-pulseStart>=pulseLength)beginSettle(MOVE);
+  if(mode==OPENING){
+    if(pos>=openCutoff()){cutoffPos=pos;motionCutoffAt=millis();beginSettle(OPEN_DONE);}
+    else if(now-operationStart>=MOTION_TIMEOUT_MS){abortMotion("opening timeout");return;}
+  }
+  if(mode==CLOSING){
+    if(pos<=closeCutoff()){cutoffPos=pos;motionCutoffAt=millis();beginSettle(CLOSE_DONE);}
+    else if(now-operationStart>=MOTION_TIMEOUT_MS){abortMotion("closing timeout");return;}
+  }
+  if(mode==SETTLING){
+    const bool fast=talking&&(settling==OPEN_DONE||settling==CLOSE_DONE);
+    const uint32_t elapsed=now-motorOffAt;
+    const bool quiet=now-lastTickAt>=(fast?FAST_QUIET_MS:NORMAL_QUIET_MS);
+    const bool minElapsed=!fast||elapsed>=MIN_FAST_COAST_MS;
+    if(elapsed>=MAX_SETTLE_MS && !quiet){abortMotion("encoder never became quiet");return;}
+    if(quiet&&minElapsed){
+      Settle completed=settling;settling=NONE;
+      if(completed==HOME){mode=IDLE;direction=STOP;Serial.print("HOME COMPLETE. Position: ");Serial.println(pos);}
+      else if(completed==MOVE){mode=MOVING;}
+      else if(completed==OPEN_DONE){finishMouth(true);}
+      else if(completed==CLOSE_DONE){finishMouth(false);}
     }
-
-    if (!synchronized) {
-        Serial.println("Use H first.");
-        return;
-    }
-
-    if (abs(signedDistance(position, MOUTH_CLOSED)) > 5) {
-        Serial.println("Move near 140 first.");
-        return;
-    }
-
-    talking = true;
-    talkCycle = 0;
-    talkStart = millis();
-
-    pendingTalkPhase = TALK_START_OPEN;
-
-    Serial.println();
-    Serial.println("============================");
-    Serial.println("FURBY RELIABLE TALKING TEST");
-    Serial.println("============================");
-
-    Serial.println("Cycles: 4");
-}
-
-// ============================================================
-// MOTION RESULT / VALIDATION
-// ============================================================
-
-void finishMotion(bool opening) {
-    unsigned long now = millis();
-
-    unsigned long poweredTime =
-        motionCutoffTime - motionStart;
-
-    unsigned long coastDuration =
-        coastTicks > 0
-            ? lastCoastTickTime - motionCutoffTime
-            : 0;
-
-    unsigned long waitAfterLastTick =
-        now - lastCoastTickTime;
-
-    int target = opening ? MOUTH_OPEN : MOUTH_CLOSED;
-    int tolerance = opening ? OPEN_TOLERANCE : CLOSE_TOLERANCE;
-
-    int error = signedDistance(position, target);
-
-    Serial.println();
-    Serial.println(
-        opening ? "--- OPEN RESULT ---" : "--- CLOSE RESULT ---"
-    );
-
-    Serial.print("Cutoff position: ");
-    Serial.println(cutoffPosition);
-
-    Serial.print("Powered ticks: ");
-    Serial.println(pulseTicks);
-
-    Serial.print("Coast ticks: ");
-    Serial.println(coastTicks);
-
-    Serial.print("Final position: ");
-    Serial.println(position);
-
-    Serial.print("Position error: ");
-    Serial.println(error);
-
-    Serial.print("Motor powered: ");
-    Serial.print(poweredTime);
-    Serial.println(" ms");
-
-    Serial.print("Last coast tick after cutoff: ");
-    Serial.print(coastDuration);
-    Serial.println(" ms");
-
-    Serial.print("Wait after last tick: ");
-    Serial.print(waitAfterLastTick);
-    Serial.println(" ms");
-
-    Serial.print("Total movement: ");
-    Serial.print(now - motionStart);
-    Serial.println(" ms");
-
-    Serial.println("--------------------");
-
-    // Finish the current motion completely.
-    mode = MODE_IDLE;
-    activeDirection = DIR_STOP;
-    settleReason = SETTLE_NONE;
-
-    if (!talking) {
-        return;
-    }
-
-    // Validate the completed motion.
-    if (coastTicks < MIN_TALK_COAST_TICKS) {
-        abortTalking("Insufficient coast ticks.");
-        return;
-    }
-
-    if (abs(error) > tolerance) {
-        abortTalking("Mouth stopped outside target tolerance.");
-        return;
-    }
-
-    // Queue the next motion.
-    // Do NOT start it inside this function.
-    if (opening) {
-        pendingTalkPhase = TALK_START_CLOSE;
-    }
-    else {
-        talkCycle++;
-
-        Serial.print("Completed cycle ");
-        Serial.print(talkCycle);
-        Serial.print("/");
-        Serial.println(TALK_CYCLES);
-
-        if (talkCycle >= TALK_CYCLES) {
-            talking = false;
-            pendingTalkPhase = TALK_NONE;
-
-            Serial.println();
-            Serial.println("TALKING COMPLETE");
-
-            Serial.print("Total animation time: ");
-            Serial.print(millis() - talkStart);
-            Serial.println(" ms");
-        }
-        else {
-            pendingTalkPhase = TALK_START_OPEN;
-        }
-    }
-}
-
-// ============================================================
-// PROCESS QUEUED TALK MOTION
-// ============================================================
-
-void processTalking() {
-    if (!talking ||
-        mode != MODE_IDLE ||
-        pendingTalkPhase == TALK_NONE) {
-        return;
-    }
-
-    TalkPhase next = pendingTalkPhase;
-    pendingTalkPhase = TALK_NONE;
-
-    bool started = false;
-
-    if (next == TALK_START_OPEN) {
-        started = startOpening();
-    }
-    else if (next == TALK_START_CLOSE) {
-        started = startClosing();
-    }
-
-    if (!started) {
-        abortTalking("Unable to start next mouth movement.");
-    }
-}
-
-// ============================================================
-// STATUS
-// ============================================================
-
-void printStatus() {
-    Serial.println();
-    Serial.println("--------- STATUS ---------");
-
-    Serial.print("Synchronized: ");
-    Serial.println(synchronized ? "YES" : "NO");
-
-    Serial.print("Estimated position: ");
-    Serial.println(position);
-
-    Serial.print("Encoder ticks: ");
-    Serial.println(totalTicks);
-
-    Serial.print("Talking: ");
-    Serial.println(talking ? "YES" : "NO");
-
-    Serial.print("Mode: ");
-    Serial.println((int)mode);
-
-    Serial.println("--------------------------");
-}
-
-// ============================================================
-// SERIAL COMMANDS
-// ============================================================
-
-void processCommand(char *command) {
-    if (command[0] == 'X' || command[0] == 'x') {
-        stopEverything();
-        return;
-    }
-
-    if (command[0] == 'S' || command[0] == 's') {
-        printStatus();
-        return;
-    }
-
-    if (command[0] == 'H' || command[0] == 'h') {
-        startHoming();
-        return;
-    }
-
-    if (command[0] == 'O' || command[0] == 'o') {
-        if (mode == MODE_IDLE && !talking) {
-            startOpening();
-        } else {
-            Serial.println("Busy.");
-        }
-        return;
-    }
-
-    if (command[0] == 'C' || command[0] == 'c') {
-        if (mode == MODE_IDLE && !talking) {
-            startClosing();
-        } else {
-            Serial.println("Busy.");
-        }
-        return;
-    }
-
-    if (command[0] == 'T' || command[0] == 't') {
-        startTalking();
-        return;
-    }
-
-    if (isdigit((unsigned char)command[0])) {
-        char *end;
-        long value = strtol(command, &end, 10);
-
-        if (*end == '\0' &&
-            value >= 0 &&
-            value < TICKS_PER_REV) {
-            startMove((int)value);
-            return;
-        }
-    }
-
-    Serial.println("Unknown command.");
-}
-
-void readSerial() {
-    while (Serial.available()) {
-        char c = Serial.read();
-
-        if (c == '\n' || c == '\r') {
-            if (inputLength > 0) {
-                inputBuffer[inputLength] = '\0';
-                processCommand(inputBuffer);
-                inputLength = 0;
-            }
-        }
-        else if (inputLength < sizeof(inputBuffer) - 1) {
-            inputBuffer[inputLength++] = c;
-        }
-    }
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
-void setup() {
-    Serial.begin(115200);
-
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    pinMode(CAM_HOME_PIN, INPUT_PULLUP);
-    pinMode(GEAR_ROTATION_PIN, INPUT_PULLUP);
-
-    digitalWrite(MOTOR_FWD_PIN, LOW);
-    digitalWrite(MOTOR_REV_PIN, LOW);
-    digitalWrite(POWER_DOWN_PIN, HIGH);
-
-    pinMode(MOTOR_FWD_PIN, OUTPUT);
-    pinMode(MOTOR_REV_PIN, OUTPUT);
-    pinMode(POWER_DOWN_PIN, OUTPUT);
-
-    motorOff();
-
-    lastGearState = digitalRead(GEAR_ROTATION_PIN);
-    lastHomeState = digitalRead(CAM_HOME_PIN);
-    homeArmed = lastHomeState == HIGH;
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("FURBY RELIABLE TALKING CONTROLLER");
-    Serial.println("================================");
-
-    Serial.println("H = Home");
-    Serial.println("140 = Closed-mouth positioning");
-    Serial.println("O = Smooth opening");
-    Serial.println("C = Smooth closing");
-    Serial.println("T = Reliable talking animation");
-    Serial.println("S = Status");
-    Serial.println("X = Stop");
-
-    Serial.println();
-    Serial.println("Ready.");
-}
-
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop() {
-    updateEncoder();
-    updateHome();
-    readSerial();
-
-    unsigned long now = millis();
-
-    // HOME TIMEOUT
-    if (mode == MODE_HOMING &&
-        now - operationStart >= HOME_TIMEOUT_MS) {
-        Serial.println("HOME TIMEOUT");
-        stopEverything();
-    }
-
-    // POSITIONING PULSE
-    if (mode == MODE_PULSING &&
-        now - pulseStart >= currentPulseDuration) {
-
-        motorOff();
-
-        motorOffTime = millis();
-        lastTickTime = motorOffTime;
-        lastCoastTickTime = motorOffTime;
-
-        settleReason = SETTLE_MOVE;
-        mode = MODE_SETTLING;
-    }
-
-    // CONTINUOUS OPENING
-    if (mode == MODE_OPENING) {
-        if (position >= OPEN_CUTOFF) {
-
-            motorOff();
-
-            cutoffPosition = position;
-            motionCutoffTime = millis();
-            motorOffTime = motionCutoffTime;
-            lastTickTime = motorOffTime;
-            lastCoastTickTime = motorOffTime;
-
-            settleReason = SETTLE_OPEN;
-            mode = MODE_SETTLING;
-        }
-        else if (now - operationStart >= MOTION_TIMEOUT_MS) {
-            Serial.println("OPEN TIMEOUT");
-            stopEverything();
-        }
-    }
-
-    // CONTINUOUS CLOSING
-    if (mode == MODE_CLOSING) {
-        if (position <= CLOSE_CUTOFF) {
-
-            motorOff();
-
-            cutoffPosition = position;
-            motionCutoffTime = millis();
-            motorOffTime = motionCutoffTime;
-            lastTickTime = motorOffTime;
-            lastCoastTickTime = motorOffTime;
-
-            settleReason = SETTLE_CLOSE;
-            mode = MODE_SETTLING;
-        }
-        else if (now - operationStart >= MOTION_TIMEOUT_MS) {
-            Serial.println("CLOSE TIMEOUT");
-            stopEverything();
-        }
-    }
-
-    // SETTLING
-    if (mode == MODE_SETTLING) {
-
-        unsigned long elapsed = now - motorOffTime;
-
-        bool fastTalkSettle =
-            talking &&
-            (settleReason == SETTLE_OPEN ||
-             settleReason == SETTLE_CLOSE);
-
-        unsigned long requiredQuiet =
-            fastTalkSettle
-                ? FAST_SETTLE_MS
-                : NORMAL_SETTLE_MS;
-
-        bool quietEnough =
-            now - lastTickTime >= requiredQuiet;
-
-        bool minimumCoastElapsed =
-            !fastTalkSettle ||
-            elapsed >= MIN_FAST_COAST_MS;
-
-        bool maximumElapsed =
-            elapsed >= MAX_SETTLE_MS;
-
-        if ((quietEnough && minimumCoastElapsed) ||
-            maximumElapsed) {
-
-            SettleReason completedReason = settleReason;
-
-            // Clear the settling state BEFORE processing
-            // the completed movement.
-            settleReason = SETTLE_NONE;
-
-            if (completedReason == SETTLE_HOME) {
-
-                Serial.print("HOME COMPLETE. Position: ");
-                Serial.println(position);
-
-                mode = MODE_IDLE;
-                activeDirection = DIR_STOP;
-            }
-            else if (completedReason == SETTLE_MOVE) {
-                mode = MODE_MOVING;
-            }
-            else if (completedReason == SETTLE_OPEN) {
-                finishMotion(true);
-            }
-            else if (completedReason == SETTLE_CLOSE) {
-                finishMotion(false);
-            }
-        }
-    }
-
-    // POSITIONING
-    if (mode == MODE_MOVING) {
-        continueMove();
-    }
-
-    // TALKING - starts only after prior movement is finished.
-    processTalking();
+  }
+  if(mode==MOVING)continueMove();
+  processTalk();
 }
